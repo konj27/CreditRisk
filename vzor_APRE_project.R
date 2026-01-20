@@ -1,150 +1,205 @@
 # ==============================================================================
-# CREDIT RISK SCORECARD - FINAL PROJECT SCRIPT
-# Dataset: mortgage_sample.csv
+# PROFESSIONAL CREDIT RISK SCORECARD (FINAL PRODUCTION SCRIPT)
+# Project: US Residential Mortgage PD Model
+# Strategy: Flexible Cohort (PIT) | 12-Month Performance Window | Macro Enabled
 # ==============================================================================
 
-# 0. SETUP & LIBRARIES
+# 0. ENVIRONMENT SETUP
 # ------------------------------------------------------------------------------
+# Install/Load necessary packages
 if(!require(scorecard)) install.packages("scorecard")
 if(!require(tidyverse)) install.packages("tidyverse")
-if(!require(caret)) install.packages("caret")
-if(!require(pROC)) install.packages("pROC")
+if(!require(caret))     install.packages("caret")
+if(!require(pROC))      install.packages("pROC")
+if(!require(car))       install.packages("car")  # For VIF Check
+if(!require(zoo))       install.packages("zoo")  # For Target Engineering
 
-library(scorecard)  # Binning, WoE, PSI, Scaling
-library(tidyverse)  # Data manipulation
-library(caret)      # Correlation functions
-library(pROC)       # AUC/ROC calculations
+library(scorecard)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(car)
+library(zoo)
 
-# 1. DATA LOAD & PREPARATION
+# 1. DATA IMPORT & FLEXIBLE COHORT CONSTRUCTION [Ref: Slide 34]
 # ------------------------------------------------------------------------------
-# [SLIDE 2: DATA SCOPE]
+# We use "Flexible Cohorts" to maximize data usage while maintaining independence.
+# We use strict Target Engineering (partial=FALSE) to ensure verified outcomes.
+
 data_raw <- read.csv("mortgage_sample.csv")
 
-# Filter for Public sample only (Good Practice)
-df_public <- data_raw %>% filter(sample == "public")
+# A. Split Raw Data (Separate Private now to avoid leakage/errors)
+df_public_raw  <- data_raw %>% filter(sample == "public")
+df_private_raw <- data_raw %>% filter(sample == "private")
 
-# Define Target and ID variables to exclude from predictors
-target_var <- "default_time"
-vars_exclude <- c("id", "time", "orig_time", "first_time", "mat_time",
-                  "payoff_time", "status_time", "sample", "default_time", "TARGET")
+cat("Step 1: Engineering Target & Building Flexible Cohorts...\n")
 
-# Initial list of inputs (Predictors)
-inputs <- setdiff(names(df_public), vars_exclude)
+# B. Engineer Target & Create Flexible Cohort (Public Only)
+df_cohort <- df_public_raw %>%
+    arrange(id, time) %>%
+    group_by(id) %>%
+    mutate(
+        # 1. Engineer Target (Look forward 12 months) [Ref: Slide 34]
+        # partial=FALSE: If we are at the end of data and can't see full 12m, return NA.
+        # This is critical to avoid labeling struggling customers as "Good".
+        target_12m = rollapply(default_time, width = 12, FUN = max,
+                               align = "left", fill = NA, partial = FALSE),
 
-# [SLIDE 2: VALIDATION STRATEGY]
-# Time-Based Split (70% Train / 30% Test)
-# We split by 'time' variable to simulate Out-of-Time (OOT) validation
-time_cutoff <- quantile(df_public$time, 0.7)
-dt_train <- df_public %>% filter(time <= time_cutoff)
-dt_test  <- df_public %>% filter(time > time_cutoff)
+        # 2. Identify "Start Time" for this specific customer
+        start_time = min(time),
 
-cat("Training Data (Time 0-", time_cutoff, "): ", nrow(dt_train), " rows\n", sep="")
-cat("Testing Data (Time ", time_cutoff, "+): ", nrow(dt_test), " rows\n", sep="")
+        # 3. Calculate "Months on Book" relative to THEIR start date
+        mob = time - start_time
+    ) %>%
+    # 4. Filter for Flexible Cohort
+    # Keep the First Observation (mob=0) and then every 12 months (mob=12, 24...)
+    # This ensures Independence (Slide 34) regardless of calendar month.
+    filter((mob %% 12) == 0) %>%
+    filter(!is.na(target_12m)) %>% # Remove rows with incomplete future
+    ungroup() %>%
+    select(-start_time, -mob) # Clean up helper columns
 
-# 2. MISSING VALUES ANALYSIS
+# C. Private Sample (Keep full for deployment check)
+df_private <- df_private_raw
+
+cat("Original Public Rows:   ", nrow(df_public_raw), "\n")
+cat("Final Flexible Cohort Rows: ", nrow(df_cohort), "\n")
+cat("Bad Rate (12m Window):  ", sprintf("%.2f%%", mean(df_cohort$target_12m)*100), "\n")
+
+
+# 2. VARIABLE SELECTION (MACRO-ENABLED) [Ref: Slide 48]
 # ------------------------------------------------------------------------------
-# [SLIDE 3: DATA CLEANING]
-# Calculate missing percentage
-missing_rates <- sapply(df_public[inputs], function(x) sum(is.na(x)) / length(x))
+# We INCLUDE macro variables (gdp, uer, hpi) to test their predictive power.
+target_var <- "target_12m"
+
+# Exclude Identifiers, Dates, and "Leakage" (current status variables)
+vars_exclude <- c("id", "time", "orig_time", "first_time", "mat_time",
+                  "payoff_time", "status_time", "sample", "default_time")
+
+# Create input list
+inputs <- setdiff(names(df_cohort), c(vars_exclude, target_var))
+
+# Check for Missing Values (>50% Removal)
+missing_rates <- sapply(df_cohort[inputs], function(x) sum(is.na(x)) / length(x))
 vars_too_missing <- names(missing_rates[missing_rates > 0.5])
 
 if(length(vars_too_missing) > 0) {
-    cat("Dropping variables with >50% missing:", paste(vars_too_missing, collapse=", "), "\n")
+    cat("\n[FILTER] Dropping variables with >50% missing:", paste(vars_too_missing, collapse=", "), "\n")
     inputs <- setdiff(inputs, vars_too_missing)
 }
 
-# 3. WOE BINNING (FEATURE ENGINEERING)
+cat("\n[INFO] Variables included for modeling (includes Macro):", length(inputs), "\n")
+
+
+# 3. SPLITTING & BINNING (WOE) [Ref: Slide 32]
 # ------------------------------------------------------------------------------
-# [SLIDE 3 & 4: TRANSFORMATION]
-# Generate Bins (Handles outliers and missing values automatically)
+# Time-Based Split (70% Train / 30% Test)
+time_cutoff <- quantile(df_cohort$time, 0.7)
+dt_train <- df_cohort %>% filter(time <= time_cutoff)
+dt_test  <- df_cohort %>% filter(time > time_cutoff)
+
+# WoE Binning (Handles Outliers & Missing Values automatically)
 bins <- woebin(dt_train, y = target_var, x = inputs, min_perc_total = 0.05)
 
-# ** FOR SLIDE 4 VISUAL **
-# Plot the binning for a key variable (e.g., FICO or LTV) to show bad rate curve
-woebin_plot(bins$FICO_orig_time)
-# (Export this plot for your presentation)
+# PLOT: Visual Check for Macro Variable (Optional)
+# If 'uer_time' exists, plot it to see risk separation
+if("uer_time" %in% names(bins)) woebin_plot(bins$uer_time)
 
-# 4. VARIABLE SELECTION (IV & CORRELATION)
+
+# 4. UNIVARIATE & MULTIVARIATE CHECKS [Ref: Slide 46]
 # ------------------------------------------------------------------------------
-# [SLIDE 5: SELECTION FUNNEL]
-
-# A. Information Value (IV) Filter > 0.02
+# A. Univariate Selection (IV > 0.02)
 iv_values <- iv(dt_train, y = target_var, x = inputs)
 strong_vars <- iv_values %>% filter(info_value > 0.02) %>% pull(variable)
-cat("Variables kept after IV filter (>0.02):", length(strong_vars), "\n")
 
-# Apply WoE values for correlation check
+cat("\n[SELECTION] Variables kept (IV > 0.02):", length(strong_vars), "\n")
+# Check if macro vars survived the IV filter
+cat("Macro vars surviving IV:", paste(intersect(strong_vars, c("gdp_time", "uer_time", "hpi_time")), collapse=", "), "\n")
+
+# B. Spearman Correlation Check (Threshold > 0.5)
+# Note: Macro vars are often correlated. This step handles multicollinearity.
 train_woe <- woebin_ply(dt_train, bins, columns = strong_vars)
 test_woe  <- woebin_ply(dt_test, bins, columns = strong_vars)
 
-# B. Spearman Correlation Filter > 0.5 (Strict)
 cor_mat <- cor(train_woe %>% select(all_of(strong_vars)), method = "spearman")
 high_corr_idx <- findCorrelation(cor_mat, cutoff = 0.5)
 high_corr_vars <- strong_vars[high_corr_idx]
-
-# Final Predictor List
 final_vars <- setdiff(strong_vars, high_corr_vars)
-cat("Final Shortlist after Correlation filter:", length(final_vars), "\n")
-print(final_vars)
 
-# 5. MODELLING (LOGISTIC REGRESSION)
+cat("[SELECTION] Dropped due to Correlation > 0.5:", paste(high_corr_vars, collapse=", "), "\n")
+
+# C. VIF Check (Variance Inflation Factor)
+cat("\n[CHECK] Calculating VIF...\n")
+form_vif <- as.formula(paste(target_var, "~", paste(final_vars, collapse=" + ")))
+m_vif_check <- glm(form_vif, data = train_woe, family = binomial())
+
+vif_vals <- car::vif(m_vif_check)
+print(vif_vals)
+
+if(any(vif_vals > 5)) cat("WARNING: High VIF (>5) detected.\n") else cat("VIF Check Passed (All < 5).\n")
+
+
+# 5. MODELLING (STEPWISE LOGISTIC REGRESSION) [Ref: Slide 40]
 # ------------------------------------------------------------------------------
-# [SLIDE 4: THE MODEL]
 train_final <- train_woe %>% select(all_of(c(target_var, final_vars)))
 test_final  <- test_woe  %>% select(all_of(c(target_var, final_vars)))
 
-# Stepwise Selection
 m_full <- glm(as.formula(paste(target_var, "~ .")), family = binomial(), data = train_final)
 m_step <- step(m_full, direction = "both", trace = 0)
 
-# View Coefficients (Log Odds)
 summary(m_step)
+# Note: Look for '***' next to macro variables in the summary.
 
-# 6. SCORECARD SCALING
+
+# 6. SCORECARD SCALING [Ref: Slide 50]
 # ------------------------------------------------------------------------------
-# [SLIDE 4 & 8: SCORECARD POINTS]
-# Base Score=600, Odds=50:1, PDO=20
-card <- scorecard(bins, m_step, points0 = 600, odds0 = 1/50, pdo = 20)
+# Parameters: Base=500, Odds=1:50, PDO=50
+# Note: Odds 1:50 corresponds to prob approx 1/51 as per Slide 50.
+card <- scorecard(bins, m_step,
+                  points0 = 500,
+                  odds0   = 1/50,
+                  pdo     = 50)
 
 # Calculate Scores
 train_score <- scorecard_ply(dt_train, card)
 test_score  <- scorecard_ply(dt_test, card)
 
-# ** FOR SLIDE 8 **
-# View the points for the first variable to put in your table
+# Print Scorecard Points (For Slide 8)
 print(card[[1]])
 
-# 7. PERFORMANCE & VALIDATION
+
+# 7. PERFORMANCE & DEPLOYMENT CHECK [Ref: Slide 68]
 # ------------------------------------------------------------------------------
-# [SLIDE 5: DISCRIMINATION / ROC]
 pred_train <- predict(m_step, newdata = train_final, type = "response")
 pred_test  <- predict(m_step, newdata = test_final, type = "response")
 
-# ROC & GINI
+# A. ROC & GINI
 roc_train <- roc(dt_train[[target_var]], pred_train)
 roc_test  <- roc(dt_test[[target_var]], pred_test)
+gini_train <- (2 * auc(roc_train) - 1) * 100
+gini_test  <- (2 * auc(roc_test) - 1) * 100
 
-auc_train <- auc(roc_train)
-auc_test  <- auc(roc_test)
+cat(sprintf("\nPERFORMANCE:\nTrain GINI: %.2f%%\nTest GINI:  %.2f%%\n", gini_train, gini_test))
 
-# ** METRICS FOR SLIDE 5 **
-cat(sprintf("Train GINI: %.2f%%\n", (2*auc_train-1)*100))
-cat(sprintf("Test GINI:  %.2f%%\n", (2*auc_test-1)*100))
+# B. ROC Plot (For Presentation)
+plot(roc_train, col="blue", main="ROC Curve: Train vs Test", lwd=2)
+lines(roc_test, col="red", lwd=2)
+legend("bottomright", legend=c("Train", "Test"), col=c("blue", "red"), lwd=2)
 
-# ** PLOT FOR SLIDE 5 **
-plot(roc_train, col="blue", main="ROC Curve: Train vs Test")
-lines(roc_test, col="red")
-legend("bottomright", legend=c("Train (Time 0-70%)", "Test (Time 70%+)"),
-       col=c("blue", "red"), lwd=2)
+# C. Deployment PSI (Public vs Private)
+# We apply the scorecard to the Private sample to check Stability.
+private_scores <- scorecard_ply(df_private, card)
 
-# [SLIDE 6: STABILITY / PSI]
-# ** PLOT FOR SLIDE 6 **
-psi_out <- perf_psi(
-    score = list(train = train_score, test = test_score),
-    label = list(train = dt_train[[target_var]], test = dt_test[[target_var]])
+psi_deployment <- perf_psi(
+    score = list(train = train_score, private = private_scores),
+    label = list(train = dt_train[[target_var]], private = rep(0, nrow(df_private)))
 )
-psi_out$pic  # This generates the PSI bar charts
 
-# [SLIDE 7: CALIBRATION]
-# ** PLOT FOR SLIDE 7 **
-perf_eva(pred = pred_train, label = dt_train[[target_var]], title = "Calibration")
+cat("\nDeployment PSI (Public vs Private):", psi_deployment$psi$PSI[1], "\n")
+psi_deployment$pic
+
+# 9. EXPORT RESULTS
+# ------------------------------------------------------------------------------
+df_private$Score <- private_scores$score
+write.csv(df_private %>% select(id, Score), "final_private_results.csv", row.names=FALSE)
+cat("\nScript Complete. Flexible Cohort + Macro Vars implemented successfully.\n")
