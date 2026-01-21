@@ -85,10 +85,20 @@ if (length(vars_missing) > 0) {
 }
 
 # 3. SPLITTING & BINNING (WOE)  -------------------------------------------
-# Time-based split (70 % Train / 30 % Test)
-time_cutoff <- quantile(df_cohort$time, 0.7)
-df_train <- df_cohort %>% filter(time <= time_cutoff)
-df_test  <- df_cohort %>% filter(time > time_cutoff)
+# Time-based split (70 % Train / 30 % Test) ===========
+
+#time_cutoff <- quantile(df_cohort$time, 0.7)
+#df_train <- df_cohort %>% filter(time <= time_cutoff)
+#df_test  <- df_cohort %>% filter(time > time_cutoff)
+
+# ===========
+
+# Random Split 70/30 =======
+train_index <- createDataPartition(df_cohort[[target_var]], p = 0.7, list = FALSE)
+
+df_train <- df_cohort[train_index, ]
+df_test  <- df_cohort[-train_index, ]
+# ========
 
 # WoE Binning (Handles outliers and missing values automatically)
 bins <- woebin(df_train, y = target_var, x = inputs, min_perc_total = 0.05)
