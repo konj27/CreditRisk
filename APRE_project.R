@@ -20,6 +20,8 @@ library(caret)
 library(pROC)
 library(car)
 library(zoo)
+library(corrplot)
+library(ggplot2)
 
 # 1. DATA IMPORT AND PREPARATION --------------------------------------------
 # Load the dataset (from the Working Directory)
@@ -30,6 +32,8 @@ data_raw <- read.csv("mortgage_sample.csv")
 # Private: Final blind validation (Deployment check)
 df_public  <- data_raw %>% filter(sample == "public")
 df_private <- data_raw %>% filter(sample == "private")
+
+ggplot(data_public)
 
 # Create Target (Public only)
 # Define custom target function:
@@ -92,6 +96,15 @@ if (length(vars_missing) > 0) {
 #df_test  <- df_cohort %>% filter(time > time_cutoff)
 
 # ===========
+
+table(df_train[[target_var]])
+prop.table(table(df_train[[target_var]]))
+ggplot(df_train, aes(x = .data[[target_var]])) +
+    geom_bar(fill = "steelblue") +
+    labs(title = "Distribution of Target Variable",
+         y = "Count",
+         x = "Target Class") +
+    theme_minimal()
 
 # Random Split 70/30 =======
 train_index <- createDataPartition(df_cohort[[target_var]], p = 0.7, list = FALSE)
