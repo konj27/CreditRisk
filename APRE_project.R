@@ -22,6 +22,7 @@ library(car)
 library(zoo)
 library(corrplot)
 library(ggplot2)
+library(glmnet)
 
 # 1. DATA IMPORT AND PREPARATION --------------------------------------------
 # Load the dataset (from the Working Directory)
@@ -126,19 +127,22 @@ iv_values <- iv(df_train, y = target_var, x = inputs)
 strong_vars <- iv_values %>% filter(info_value > 0.02) %>% pull(variable)
 
 cat("\nVariables kept (IV > 0.02):", length(strong_vars), "\n")
+strong_vars
 
 # Correlation check (Threshold > 0.5, Prevents multicolinearity)
 strong_vars_woe <- paste0(strong_vars, "_woe")
 vars_to_check <- intersect(names(train_woe), strong_vars_woe)
 cor_mat <- cor(train_woe %>% select(all_of(vars_to_check)), method = "spearman")
+corrplot(cor_mat)
 
 # Find high correlations
 high_corr_idx <- findCorrelation(cor_mat, cutoff = 0.5)
 high_corr_vars_woe <- vars_to_check[high_corr_idx]
+high_corr_vars_woe
 
 # Identify final variables (Keep the '_woe' version for modeling)
 final_vars_woe <- setdiff(vars_to_check, high_corr_vars_woe)
-
+final_vars_woe
 cat("Dropped due to Correlation > 0.5:", paste(high_corr_vars_woe, collapse = ", "), "\n")
 
 # VIF check
@@ -206,3 +210,31 @@ psi_deployment$pic
 df_private$Score <- private_scores$score
 write.csv(df_private %>% select(id, Score), "final_private_results.csv", row.names = FALSE)
 cat("\nResults saved to 'final_private_results.csv'.\n")
+
+
+#LASSO
+lasso_train_x <- as.matrix(train_final %>% select(-all_of(target_var)))
+lasso_train_y <- train_final[[target_var]]
+
+lasso_cv <- cv.glmnet(lasso_train_x, lasso_train_y, family = "binomial", alpha = 1)
+coef_lasso <- coef(lasso_cv, s = "lambda.1se")
+coef_lasso
+
+selected_vars_lasso <- rownames(coef_lasso)[which(coef_lasso != 0)]
+selected_vars_lasso <- selected_vars_lasso[selected_vars_lasso != "(Intercept)"]
+
+final_formula <- as.formula(paste(target_var, "~", paste(selected_vars_lasso, collapse = " + ")))
+m_step <- glm(final_formula, family = binomial(), data = train_final)
+summary(m_step)
+
+
+coef_lasso_stronger <- coef(lasso_cv, s = "lambda.min")
+coef_lasso_stronger
+
+selected_vars_lasso_stronger <- rownames(coef_lasso_stronger)[which(coef_lasso_stronger != 0)]
+selected_vars_lasso_stronger <- selected_vars_lasso_stronger[selected_vars_lasso_stronger != "(Intercept)"]
+
+final_formula_stronger <- as.formula(paste(target_var, "~", paste(selected_vars_lasso_stronger, collapse = " + ")))
+m_step_stronger <- glm(final_formula_stronger, family = binomial(), data = train_final)
+
+summary(m_step_stronger)
