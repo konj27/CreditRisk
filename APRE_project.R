@@ -11,8 +11,11 @@ if (!require(scorecard)) install.packages("scorecard")
 if (!require(tidyverse)) install.packages("tidyverse")
 if (!require(caret)) install.packages("caret")
 if (!require(pROC)) install.packages("pROC")
-if(!require(car)) install.packages("car")
-if(!require(zoo)) install.packages("zoo")
+if (!require(car)) install.packages("car")
+if (!require(zoo)) install.packages("zoo")
+if (!require(corrplot)) install.packages("corrplot")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(glmnet)) install.packages("glmnet")
 
 library(scorecard)
 library(tidyverse)
@@ -33,8 +36,6 @@ data_raw <- read.csv("mortgage_sample.csv")
 # Private: Final blind validation (Deployment check)
 df_public  <- data_raw %>% filter(sample == "public")
 df_private <- data_raw %>% filter(sample == "private")
-
-ggplot(data_public)
 
 # Create Target (Public only)
 # Define custom target function:
@@ -90,14 +91,23 @@ if (length(vars_missing) > 0) {
 }
 
 # 3. SPLITTING & BINNING (WOE)  -------------------------------------------
-# Time-based split (70 % Train / 30 % Test) ===========
+
+# ===========
+# Time-based split (70 % Train / 30 % Test)
 
 #time_cutoff <- quantile(df_cohort$time, 0.7)
 #df_train <- df_cohort %>% filter(time <= time_cutoff)
 #df_test  <- df_cohort %>% filter(time > time_cutoff)
-
 # ===========
 
+# Random Split 70/30 =======
+train_index <- createDataPartition(df_cohort[[target_var]], p = 0.7, list = FALSE)
+
+df_train <- df_cohort[train_index, ]
+df_test  <- df_cohort[-train_index, ]
+# ========
+
+# Distribution on Target variable
 table(df_train[[target_var]])
 prop.table(table(df_train[[target_var]]))
 ggplot(df_train, aes(x = .data[[target_var]])) +
@@ -106,13 +116,6 @@ ggplot(df_train, aes(x = .data[[target_var]])) +
          y = "Count",
          x = "Target Class") +
     theme_minimal()
-
-# Random Split 70/30 =======
-train_index <- createDataPartition(df_cohort[[target_var]], p = 0.7, list = FALSE)
-
-df_train <- df_cohort[train_index, ]
-df_test  <- df_cohort[-train_index, ]
-# ========
 
 # WoE Binning (Handles outliers and missing values automatically)
 bins <- woebin(df_train, y = target_var, x = inputs, min_perc_total = 0.05)
@@ -127,7 +130,7 @@ iv_values <- iv(df_train, y = target_var, x = inputs)
 strong_vars <- iv_values %>% filter(info_value > 0.02) %>% pull(variable)
 
 cat("\nVariables kept (IV > 0.02):", length(strong_vars), "\n")
-strong_vars
+print(strong_vars)
 
 # Correlation check (Threshold > 0.5, Prevents multicolinearity)
 strong_vars_woe <- paste0(strong_vars, "_woe")
@@ -138,7 +141,6 @@ corrplot(cor_mat)
 # Find high correlations
 high_corr_idx <- findCorrelation(cor_mat, cutoff = 0.5)
 high_corr_vars_woe <- vars_to_check[high_corr_idx]
-high_corr_vars_woe
 
 # Identify final variables (Keep the '_woe' version for modeling)
 final_vars_woe <- setdiff(vars_to_check, high_corr_vars_woe)
@@ -211,30 +213,44 @@ df_private$Score <- private_scores$score
 write.csv(df_private %>% select(id, Score), "final_private_results.csv", row.names = FALSE)
 cat("\nResults saved to 'final_private_results.csv'.\n")
 
+# -------------------------------------------------------------------------
 
-#LASSO
-lasso_train_x <- as.matrix(train_final %>% select(-all_of(target_var)))
-lasso_train_y <- train_final[[target_var]]
+# 10. DEMONSTRATION: LASSO MODEL COMPARISON -------------------------------
+# Run LASSO
+x_matrix <- as.matrix(train_final %>% select(-all_of(target_var)))
+y_vector <- train_final[[target_var]]
 
-lasso_cv <- cv.glmnet(lasso_train_x, lasso_train_y, family = "binomial", alpha = 1)
+lasso_cv <- cv.glmnet(x_matrix, y_vector, family = "binomial", alpha = 1, type.measure = "auc")
 coef_lasso <- coef(lasso_cv, s = "lambda.1se")
-coef_lasso
 
-selected_vars_lasso <- rownames(coef_lasso)[which(coef_lasso != 0)]
-selected_vars_lasso <- selected_vars_lasso[selected_vars_lasso != "(Intercept)"]
+# Extract LASSO variables
+lasso_vars <- rownames(coef_lasso)[which(coef_lasso != 0)]
+lasso_vars <- lasso_vars[lasso_vars != "(Intercept)"]
 
-final_formula <- as.formula(paste(target_var, "~", paste(selected_vars_lasso, collapse = " + ")))
-m_step <- glm(final_formula, family = binomial(), data = train_final)
-summary(m_step)
+# Refit GLM for LASSO (to get comparable GINI)
+if(length(lasso_vars) > 0) {
+    form_lasso <- as.formula(paste(target_var, "~", paste(lasso_vars, collapse = " + ")))
+    m_lasso <- glm(form_lasso, family = binomial(), data = train_final)
 
+    # Calculate LASSO Performance
+    pred_lasso_test <- predict(m_lasso, newdata = test_final, type="response")
+    roc_lasso <- roc(test_final[[target_var]], pred_lasso_test, quiet = TRUE)
+    gini_lasso <- (2 * auc(roc_lasso) - 1) * 100
+} else {
+    gini_lasso <- 0
+    m_lasso <- NULL
+}
 
-coef_lasso_stronger <- coef(lasso_cv, s = "lambda.min")
-coef_lasso_stronger
+# Comparison table
+comparison <- data.frame(
+    Metric = c("Variables Selected", "Test GINI"),
+    Stepwise_Main = c(length(coef(m_step))-1, sprintf("%.2f%%", gini_test)),
+    Lasso_Challenger = c(length(lasso_vars), sprintf("%.2f%%", gini_lasso))
+)
+print(comparison)
 
-selected_vars_lasso_stronger <- rownames(coef_lasso_stronger)[which(coef_lasso_stronger != 0)]
-selected_vars_lasso_stronger <- selected_vars_lasso_stronger[selected_vars_lasso_stronger != "(Intercept)"]
-
-final_formula_stronger <- as.formula(paste(target_var, "~", paste(selected_vars_lasso_stronger, collapse = " + ")))
-m_step_stronger <- glm(final_formula_stronger, family = binomial(), data = train_final)
-
-summary(m_step_stronger)
+# Plot comparison ROC
+plot(roc_test, col = "blue", lwd = 2, main = "ROC Comparison: Stepwise vs LASSO")
+if (!is.null(m_lasso)) lines(roc_lasso, col = "red", lwd = 2, lty = 2)
+legend("bottomright", legend = c("Stepwise (Main)", "LASSO (Challenger)"),
+       col = c("blue", "red"), lwd = 2, lty = 1:2)
