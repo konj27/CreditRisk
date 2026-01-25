@@ -71,6 +71,15 @@ df_cohort <- df_public %>%
     ungroup() %>%
     select(-t_from_start) # Clean up helper columns
 
+# Apply annual snapshot logic to private data (12 months windows)
+df_private <- df_private %>%
+    arrange(id, time) %>%
+    group_by(id) %>%
+    mutate(t_from_start = time - first_time) %>%
+    filter((t_from_start %% 12) == 0) %>%
+    ungroup() %>%
+    select(-t_from_start)
+
 # 2. VARIABLE SELECTION ---------------------------------------------------
 # Define target variable
 target_var <- "target_12m"
@@ -92,20 +101,19 @@ if (length(vars_missing) > 0) {
 
 # 3. SPLITTING & BINNING (WOE)  -------------------------------------------
 
-# ===========
-# Time-based split (70 % Train / 30 % Test)
+# ===
+# DISABLED Time-based split (70 % Train / 30 % Test)
 
 #time_cutoff <- quantile(df_cohort$time, 0.7)
 #df_train <- df_cohort %>% filter(time <= time_cutoff)
 #df_test  <- df_cohort %>% filter(time > time_cutoff)
-# ===========
+# ===
 
-# Random Split 70/30 =======
+# Stratified Random Split 70/30
 train_index <- createDataPartition(df_cohort[[target_var]], p = 0.7, list = FALSE)
 
 df_train <- df_cohort[train_index, ]
 df_test  <- df_cohort[-train_index, ]
-# ========
 
 # Distribution on Target variable
 table(df_train[[target_var]])
@@ -123,6 +131,7 @@ bins <- woebin(df_train, y = target_var, x = inputs, min_perc_total = 0.05)
 # WoE Transformation
 train_woe <- woebin_ply(df_train, bins)
 test_woe  <- woebin_ply(df_test, bins)
+private_woe <- woebin_ply(df_private, bins)
 
 # 4. UNIVARIATE AND MULTIVARIATE CHECKS -----------------------------------
 # IV selection (> 0.02)
@@ -170,8 +179,8 @@ summary(m_step)
 # Parameters: Base = 500, Odds = 1:50, PDO = 50
 card <- scorecard(bins, m_step,
                   points0 = 500,
-                  odds0   = 1/50,
-                  pdo     = 50)
+                  odds0 = 1/50,
+                  pdo = 50)
 
 # Calculate scores
 train_score <- scorecard_ply(df_train, card)
@@ -209,13 +218,17 @@ cat("\nDeployment PSI (Public vs Private):", psi_deployment$psi$psi[1], "\n")
 psi_deployment$pic
 
 # 9. EXPORT RESULTS -------------------------------------------------------
-df_private$Score <- private_scores$score
-write.csv(df_private %>% select(id, Score), "final_private_results.csv", row.names = FALSE)
-cat("\nResults saved to 'final_private_results.csv'.\n")
+df_export <- df_private %>%
+    mutate(
+        Score = private_scores$score,
+        PD = predict(m_step, newdata = private_woe, type = "response") # % of risk
+    ) %>%
+    select(id, time, Score, PD)
 
-# -------------------------------------------------------------------------
+write.csv(df_export, "final_private_results.csv", row.names = FALSE)
+cat("\nResults saved (Score + PD).\n")
 
-# 10. DEMONSTRATION: LASSO MODEL COMPARISON -------------------------------
+# 10. CHALLENGER DEMONSTRATION: LASSO MODEL COMPARISON -------------------------------
 # Run LASSO
 x_matrix <- as.matrix(train_final %>% select(-all_of(target_var)))
 y_vector <- train_final[[target_var]]
